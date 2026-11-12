@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>paperweight</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  body {
+    background: #f2ece1;
+    color: #181715;
+    font-family: Georgia, 'Times New Roman', serif;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 36px;
+    background: #e6dec8;
+    border-bottom: 2px solid #181715;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 10px;
+    z-index: 10;
+    font-size: 13px;
+  }
+  .row { display: flex; align-items: center; gap: 6px; }
+  .mono { font-family: 'Courier New', monospace; font-weight: bold; font-size: 12px; }
+  button {
+    background: #f2ece1;
+    color: #181715;
+    border: 1.5px solid #181715;
+    padding: 2px 8px;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 2px 2px 0 #181715;
+  }
+  button:active {
+    transform: translate(2px, 2px);
+    box-shadow: none;
+  }
+  button.active {
+    background: #181715;
+    color: #f2ece1;
+  }
+  .tag {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 6px;
+    border: 1.5px solid #181715;
+    background: #faf6ee;
+  }
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <div class="row">
+    <span id="label" class="mono">STAGE 1/100</span>
+    <span id="abilBar" class="row" style="margin-left:6px;">
+      <span id="tagDash" class="tag">SHIFT: DASH</span>
+      <span id="tagSlam" class="tag">S/DOWN: SLAM</span>
+      <span id="tagPlat" class="tag">E: INK LEDGE</span>
+      <span id="tagJumps" class="tag" style="display:none;">AIR JUMPS: 1</span>
+    </span>
+    <span id="sub" style="margin-left:6px; color:#5a554c; font-size:12px;"></span>
+  </div>
+  <div class="row" id="hostControls">
+    <button id="modePuzzle" class="active" onclick="setMode('puzzle')">100 stages</button>
+    <button id="modeEndless" onclick="setMode('endless')">endless</button>
+    <button id="modeChaos" onclick="setMode('chaos')">chaos mode</button>
+    <span id="puzzleBtns" class="row">
+      <button onclick="skipLevel(-1)">prev</button>
+      <button onclick="skipLevel(1)">next</button>
+      <button onclick="openPopups()">spawn windows</button>
+    </span>
+    <button onclick="askReset()">reset [R]</button>
+  </div>
+</div>
+<canvas id="c"></canvas>
+
+<script>
+const params = new URLSearchParams(location.search);
+const winId = parseInt(params.get('w') || '0', 10);
+const isHost = winId === 0;
+const bus = new BroadcastChannel('pw_sync_v4');
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const labelEl = document.getElementById('label');
+const subEl = document.getElementById('sub');
+const tagDash = document.getElementById('tagDash');
+const tagSlam = document.getElementById('tagSlam');
+const tagPlat = document.getElementById('tagPlat');
+const tagJumps = document.getElementById('tagJumps');
+
+if (!isHost) {
+  document.getElementById('hostControls').style.display = 'none';
+}
+
+const COL = {
+  bg: '#f2ece1',
+  grid: '#dfd7c5',
+  ink: '#181715',
+  paper: '#faf6ee',
+  red: '#d1492f',
+  gold: '#df9a28',
+  teal: '#2a6f64',
+  muted: '#8c8476'
+};
+
+let actx = null;
+function snd(freq, type, dur, slide = 0, vol = 0.08) {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, actx.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g);
+    g.connect(actx.destination);
+    o.start();
+    o.stop(actx.currentTime + dur);
+  } catch (e) {}
+}
+
+function mulberry32(a) {
+  return function() {
+    let t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function getStage(idx) {
+  const intro = [
+    {
+      note: "drag window #1 beside window #0 and hop across",
+      wins: 2,
+      spawn: { w: 0, x: 50, y: 190 },
+      plats: [
+        { w: 0, x: 20, y: 240, width: 370, height: 22, kind: 'solid' },
+        { w: 1, x: 20, y: 240, width: 370, height: 22, kind: 'solid' }
+      ],
+      exit: { w: 1, x: 330, y: 200, locked: false },
+      beams: [], targets: [], mirrors: [], keys: []
+    },
+    {
+      note: "place window #1 below window #0 to hit the spring pad",
+      wins: 2,
+      spawn: { w: 0, x: 50, y: 100 },
+      plats: [
+        { w: 0, x: 20, y: 150, width: 140, height: 20, kind: 'solid' },
+        { w: 0, x: 200, y: 255, width: 180, height: 18, kind: 'hazard' },
+        { w: 1, x: 35, y: 265, width: 140, height: 20, kind: 'spring' },
+        { w: 1, x: 230, y: 145, width: 150, height: 20, kind: 'solid' }
+      ],
+      exit: { w: 1, x: 310, y: 105, locked: false },
+      beams: [], targets: [], mirrors: [], keys: []
+    },
+    {
+      note: "align window #1 so the red beam hits the teal block",
+      wins: 2,
+      spawn: { w: 0, x: 50, y: 200 },
+      plats: [
+        { w: 0, x: 20, y: 255, width: 370, height: 20, kind: 'solid' },
+        { w: 1, x: 20, y: 255, width: 370, height: 20, kind: 'solid' }
+      ],
+      beams: [{ w: 0, x: 385, y: 140, dx: 1, dy: 0 }],
+      targets: [{ w: 1, x: 25, y: 125, width: 24, height: 30 }],
+      exit: { w: 1, x: 335, y: 215, locked: true },
+      mirrors: [], keys: []
+    },
+    {
+      note: "spawn window #2, collect the key ring, and climb to the exit",
+      wins: 3,
+      spawn: { w: 0, x: 50, y: 200 },
+      plats: [
+        { w: 0, x: 20, y: 255, width: 350, height: 20, kind: 'solid' },
+        { w: 1, x: 35, y: 220, width: 330, height: 20, kind: 'solid' },
+        { w: 2, x: 35, y: 185, width: 330, height: 20, kind: 'solid' }
+      ],
+      keys: [{ w: 1, x: 195, y: 180 }],
+      exit: { w: 2, x: 305, y: 145, locked: true },
+      beams: [], targets: [], mirrors: []
+    },
+    {
+      note: "angle the beam off window #1's mirror up into window #2",
+      wins: 3,
+      spawn: { w: 0, x: 50, y: 200 },
+      plats: [
+        { w: 0, x: 20, y: 255, width: 370, height: 20, kind: 'solid' },
+        { w: 1, x: 20, y: 255, width: 370, height: 20, kind: 'solid' },
+        { w: 2, x: 20, y: 255, width: 370, height: 20, kind: 'solid' }
+      ],
+      beams: [{ w: 0, x: 385, y: 175, dx: 1, dy: 0 }],
+      mirrors: [{ w: 1, x: 180, y: 155, size: 38 }],
+      targets: [{ w: 2, x: 185, y: 200, width: 28, height: 28 }],
+      exit: { w: 2, x: 330, y: 215, locked: true },
+      keys: []
+    }
+  ];
+
+  if (idx < intro.length) return intro[idx];
+
+  const rng = mulberry32((idx + 1) * 9187);
+  const rInt = (min, max) => Math.floor(min + rng() * (max - min));
+  const kind = idx % 5;
+  const wins = (idx >= 8 && idx % 3 === 0) ? 3 : 2;
+  const lastW = wins - 1;
+
+  const st = {
+    note: "",
+    wins,
+    spawn: { w: 0, x: 45, y: 185 },
+    plats: [],
+    exit: { w: lastW, x: 335, y: 195, locked: false },
+    beams: [], targets: [], mirrors: [], keys: []
+  };
+
+  if (kind === 0) {
+    st.note = "cross the moving ledges (use SHIFT dash or E ink ledge)";
+    st.plats.push({ w: 0, x: 20, y: 240, width: 110, height: 20, kind: 'solid' });
+    st.plats.push({ w: 0, x: 180, y: rInt(160, 230), width: 95, height: 18, kind: 'solid', vx: 1.4, minX: 145, maxX: 280 });
+    st.plats.push({ w: 0, x: 150, y: 285, width: 230, height: 16, kind: 'hazard' });
+
+    for (let w = 1; w < wins; w++) {
+      const py = rInt(150, 235);
+      st.plats.push({ w, x: 30, y: py, width: 100, height: 18, kind: rng() > 0.5 ? 'spring' : 'solid' });
+      st.plats.push({ w, x: 165, y: 275, width: 130, height: 16, kind: 'hazard' });
+      const endY = rInt(140, 230);
+      st.plats.push({ w, x: 260, y: endY, width: 120, height: 20, kind: 'solid' });
+      if (w === lastW) st.exit.y = endY - 40;
+    }
+  } else if (kind === 1) {
+    st.note = "stack windows vertically to bounce past the hazards";
+    const sy = rInt(130, 175);
+    st.spawn.y = sy - 50;
+    st.plats.push({ w: 0, x: 25, y: sy, width: 120, height: 20, kind: 'solid' });
+    st.plats.push({ w: 0, x: 180, y: sy + 55, width: 190, height: 18, kind: 'hazard' });
+
+    st.plats.push({ w: 1, x: rInt(40, 140), y: 265, width: 115, height: 20, kind: 'spring' });
+    if (wins === 3) {
+      st.plats.push({ w: 1, x: 240, y: 170, width: 110, height: 18, kind: 'spring' });
+      st.plats.push({ w: 2, x: 60, y: 240, width: 130, height: 18, kind: 'hazard' });
+      st.plats.push({ w: 2, x: 230, y: 150, width: 140, height: 20, kind: 'solid' });
+      st.exit = { w: 2, x: 310, y: 110, locked: false };
+    } else {
+      const ey = rInt(115, 160);
+      st.plats.push({ w: 1, x: 235, y: ey, width: 140, height: 20, kind: 'solid' });
+      st.exit = { w: 1, x: 315, y: ey - 40, locked: false };
+    }
+  } else if (kind === 2) {
+    st.note = "align the beam with the sensor while jumping the gap";
+    const by = rInt(95, 165);
+    st.plats.push({ w: 0, x: 20, y: 250, width: 160, height: 20, kind: 'solid' });
+    st.plats.push({ w: 0, x: 220, y: 250, width: 160, height: 20, kind: 'solid' });
+    st.beams.push({ w: 0, x: 385, y: by, dx: 1, dy: 0 });
+
+    st.plats.push({ w: lastW, x: 25, y: 250, width: 140, height: 20, kind: 'solid' });
+    st.plats.push({ w: lastW, x: 175, y: 265, width: 85, height: 16, kind: 'hazard' });
+    st.plats.push({ w: lastW, x: 270, y: 230, width: 120, height: 20, kind: 'solid' });
+    st.targets.push({ w: lastW, x: rInt(30, 90), y: by - 12, width: 24, height: 28 });
+    st.exit = { w: lastW, x: 340, y: 190, locked: true };
+    if (wins === 3) {
+      st.plats.push({ w: 1, x: 40, y: 235, width: 320, height: 20, kind: 'solid' });
+    }
+  } else if (kind === 3) {
+    st.note = "grab the brass key before heading to the exit";
+    st.plats.push({ w: 0, x: 20, y: 250, width: 340, height: 20, kind: 'solid' });
+    const ky = rInt(165, 225);
+    st.plats.push({ w: 1, x: 40, y: ky + 35, width: 120, height: 18, kind: 'solid', vx: 1.5, minX: 30, maxX: 240 });
+    st.keys.push({ w: 1, x: 160, y: ky - 5 });
+
+    if (wins === 3) {
+      st.plats.push({ w: 2, x: 35, y: 235, width: 120, height: 18, kind: 'spring' });
+      st.plats.push({ w: 2, x: 220, y: 155, width: 150, height: 20, kind: 'solid' });
+      st.exit = { w: 2, x: 310, y: 115, locked: true };
+    } else {
+      st.plats.push({ w: 1, x: 250, y: 175, width: 130, height: 20, kind: 'solid' });
+      st.exit = { w: 1, x: 325, y: 135, locked: true };
+    }
+  } else {
+    st.note = "bounce the beam off the mirror into the target";
+    const by = rInt(145, 195);
+    const mx = rInt(130, 230);
+    st.plats.push({ w: 0, x: 20, y: 255, width: 360, height: 20, kind: 'solid' });
+    st.plats.push({ w: 1, x: 20, y: 255, width: 360, height: 20, kind: 'solid' });
+    st.beams.push({ w: 0, x: 385, y: by, dx: 1, dy: 0 });
+    st.mirrors.push({ w: 1, x: mx, y: by - 20, size: 38 });
+
+    if (wins === 3) {
+      st.plats.push({ w: 2, x: 20, y: 255, width: 360, height: 20, kind: 'solid' });
+      st.targets.push({ w: 2, x: mx + 5, y: 195, width: 28, height: 28 });
+      st.exit = { w: 2, x: 330, y: 215, locked: true };
+    } else {
+      st.targets.push({ w: 0, x: rInt(150, 260), y: 80, width: 28, height: 28 });
+      st.exit = { w: 1, x: 330, y: 215, locked: true };
+    }
+  }
+
+  return st;
+}
+
+// state
+let mode = 'puzzle'; // 'puzzle' | 'endless' | 'chaos'
+let curIdx = 0;
+let curStage = getStage(0);
+let popups = [];
+let winRects = {};
+let smoothRect = null;
+let keys = {};
+let prevJumpKey = false;
+let prevDashKey = false;
+let prevPlatKey = false;
+let prevSlamKey = false;
+
+let particles = [];
+let inkPlats = []; // temporary platforms spawned by E ability
+let meteors = [];  // falling ink blots in chaos mode
+let shake = 0;
+let bannerText = "";
+let bannerTimer = 0;
+
+let bestDist = parseInt(localStorage.getItem('pw_best_dist') || '0', 10);
+let bestChaos = parseInt(localStorage.getItem('pw_best_chaos') || '0', 10);
+
+let coyote = 0;
+let airJumpsLeft = 1;
+let maxAirJumps = 1;
+
+// abilities cooldowns/timers
+let dashTimer = 0;
+let dashCd = 0;
+let slamming = false;
+let platCd = 0;
+
+// chaos modifier state
+let chaosEvent = "NORMAL";
+let chaosClock = 300;
+let gravSign = 1;
+let speedMult = 1;
+
+let endless = {
+  camX: 0,
+  nextX: 0,
+  dist: 0,
+  lastMilestone: 0,
+  plats: []
+};
+
+let state = {
+  mode: 'puzzle',
+  lvl: 0,
+  p: { x: 0, y: 0, vx: 0, vy: 0, w: 22, h: 22, sx: 1, sy: 1, dir: 1 },
+  open: true,
+  gotKey: false,
+  rays: [],
+  platOffsets: [],
+  inkPlats: [],
+  rects: {}
+};
+
+function getMyRect() {
+  const bx = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const by = Math.max(0, (window.outerHeight - window.innerHeight) - bx);
+  return {
+    id: winId,
+    x: window.screenX + bx,
+    y: window.screenY + by,
+    w: window.innerWidth,
+    h: window.innerHeight,
+    t: Date.now()
+  };
+}
+
+function showBanner(txt) {
+  bannerText = txt;
+  bannerTimer = 110;
+}
+
+function setMode(m) {
+  if (!isHost) return;
+  mode = m;
+  state.mode = m;
+  document.getElementById('modePuzzle').className = m === 'puzzle' ? 'active' : '';
+  document.getElementById('modeEndless').className = m === 'endless' ? 'active' : '';
+  document.getElementById('modeChaos').className = m === 'chaos' ? 'active' : '';
+  document.getElementById('puzzleBtns').style.display = m === 'puzzle' ? 'flex' : 'none';
+  tagJumps.style.display = m === 'puzzle' ? 'none' : 'inline-block';
+
+  gravSign = 1;
+  speedMult = 1;
+  chaosEvent = "NORMAL";
+
+  if (m === 'endless' || m === 'chaos') {
+    initEndless();
+  } else {
+    maxAirJumps = 1;
+    loadStage(curIdx);
+  }
+}
+
+function skipLevel(delta) {
+  if (!isHost || mode !== 'puzzle') return;
+  curIdx = (curIdx + delta + 100) % 100;
+  loadStage(curIdx);
+}
+
+function openPopups() {
+  if (!isHost || mode !== 'puzzle') return;
+  const needed = curStage.wins;
+  for (let i = 1; i < needed; i++) {
+    if (!popups[i] || popups[i].closed) {
+      const lx = window.screenX + i * 435;
+      const ly = window.screenY + (i === 2 ? -110 : 20);
+      popups[i] = window.open(
+        `${location.pathname}?w=${i}`,
+        `pw_win_${i}`,
+        `width=420,height=320,left=${lx},top=${ly},resizable=yes`
+      );
+    }
+  }
+  snd(340, 'triangle', 0.09, 120);
+}
+
+function resetAbilities() {
+  dashTimer = 0;
+  dashCd = 0;
+  slamming = false;
+  platCd = 0;
+  inkPlats = [];
+  meteors = [];
+  gravSign = 1;
+  speedMult = 1;
+}
+
+function loadStage(idx) {
+  curIdx = idx % 100;
+  curStage = getStage(curIdx);
+  winRects[0] = getMyRect();
+  const sw = winRects[curStage.spawn.w] || winRects[0];
+
+  resetAbilities();
+  maxAirJumps = 1;
+  airJumpsLeft = 1;
+
+  state.lvl = curIdx;
+  state.p.x = sw.x + curStage.spawn.x;
+  state.p.y = sw.y + curStage.spawn.y;
+  state.p.vx = 0;
+  state.p.vy = 0;
+  state.p.sx = 1;
+  state.p.sy = 1;
+  state.open = !curStage.exit.locked;
+  state.gotKey = false;
+  state.rays = [];
+  coyote = 0;
+
+  if (isHost) openPopups();
+}
+
+function initEndless() {
+  resetAbilities();
+  endless.camX = 0;
+  endless.nextX = 0;
+  endless.dist = 0;
+  endless.lastMilestone = 0;
+  endless.plats = [];
+  maxAirJumps = 1;
+  airJumpsLeft = 1;
+  chaosClock = 240;
+  chaosEvent = mode === 'chaos' ? "GET READY!" : "";
+
+  endless.plats.push({ x: 40, y: window.innerHeight - 110, w: 340, h: 24, kind: 'solid' });
+  endless.nextX = 420;
+  while (endless.nextX < window.innerWidth + 600) {
+    spawnEndlessChunk();
+  }
+
+  state.p.x = 90;
+  state.p.y = window.innerHeight - 160;
+  state.p.vx = 0;
+  state.p.vy = 0;
+  coyote = 0;
+}
+
+function spawnEndlessChunk() {
+  const isChaos = mode === 'chaos';
+  const baseH = window.innerHeight - 120;
+  const speedScale = Math.min(1.75, 1 + endless.dist / 2200);
+  const gap = (60 + Math.random() * (isChaos ? 115 : 85)) * speedScale;
+  const w = (isChaos ? 75 : 95) + Math.random() * 165;
+  const yOff = (Math.random() - 0.5) * (isChaos ? 180 : 130);
+  const py = Math.max(115, Math.min(window.innerHeight - 75, baseH + yOff));
+
+  const roll = Math.random();
+  let kind = 'solid';
+  if (roll < (isChaos ? 0.28 : 0.18)) kind = 'spring';
+  else if (roll < (isChaos ? 0.52 : 0.34)) kind = 'crumble';
+  else if (roll < (isChaos ? 0.72 : 0.48) && w > 110) kind = 'moving';
+
+  const plat = {
+    x: endless.nextX + gap,
+    y: py,
+    w,
+    h: 22,
+    kind,
+    touched: false,
+    fallTimer: isChaos ? 14 : 22,
+    vy: 0,
+    vx: kind === 'moving' ? (Math.random() > 0.5 ? 2.1 : -2.1) : 0,
+    minX: endless.nextX + gap - 45,
+    maxX: endless.nextX + gap + 65
+  };
+  endless.plats.push(plat);
+
+  if (kind === 'solid' && w > 155 && Math.random() < (isChaos ? 0.75 : 0.5)) {
+    endless.plats.push({
+      x: plat.x + w * 0.45,
+      y: py - 14,
+      w: 26,
+      h: 14,
+      kind: 'hazard'
+    });
+  }
+
+  if (Math.random() < 0.3) {
+    endless.plats.push({
+      x: plat.x + 20,
+      y: Math.max(85, py - 115),
+      w: 75,
+      h: 16,
+      kind: Math.random() < 0.4 ? 'spring' : 'solid'
+    });
+  }
+
+  endless.nextX = plat.x + w;
+}
+
+function askReset() {
+  if (isHost) {
+    snd(160, 'sawtooth', 0.16, -60);
+    shake = 7;
+    if (mode === 'endless' || mode === 'chaos') initEndless();
+    else loadStage(curIdx);
+  } else {
+    bus.postMessage({ cmd: 'reset' });
+  }
+}
+
+function wipeKeys() {
+  keys = {};
+  if (!isHost) bus.postMessage({ cmd: 'wipe' });
+}
+window.addEventListener('blur', wipeKeys);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) wipeKeys();
+});
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'r') { askReset(); return; }
+  keys[k] = true;
+  if (!isHost) bus.postMessage({ cmd: 'k', k, v: true });
+});
+
+window.addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  keys[k] = false;
+  if (!isHost) bus.postMessage({ cmd: 'k', k, v: false });
+});
+
+bus.onmessage = e => {
+  const d = e.data;
+  if (isHost) {
+    if (d.cmd === 'rect') winRects[d.rect.id] = d.rect;
+    if (d.cmd === 'k') keys[d.k] = d.v;
+    if (d.cmd === 'wipe') keys = {};
+    if (d.cmd === 'reset') askReset();
+  } else {
+    if (d.cmd === 'state') {
+      state = d.state;
+      if (state.lvl !== curIdx) {
+        curIdx = state.lvl;
+        curStage = getStage(curIdx);
+      }
+    }
+    if (d.cmd === 'snd') snd(d.f, d.t, d.dur, d.s);
+  }
+};
+
+function sndAll(f, t, dur, s = 0) {
+  snd(f, t, dur, s);
+  bus.postMessage({ cmd: 'snd', f, t, dur, s });
+}
+
+function burst(x, y, c, n = 10) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 1.2 + Math.random() * 4;
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, c });
+  }
+}
+
+function updateAbilityHUD() {
+  tagDash.style.background = dashCd > 0 ? '#dfd7c5' : '#faf6ee';
+  tagDash.textContent = dashCd > 0 ? `SHIFT: ${Math.ceil(dashCd / 10)}` : `SHIFT: DASH`;
+
+  tagSlam.style.background = slamming ? COL.gold : '#faf6ee';
+  tagSlam.textContent = `S/DOWN: SLAM`;
+
+  tagPlat.style.background = platCd > 0 ? '#dfd7c5' : '#faf6ee';
+  tagPlat.textContent = platCd > 0 ? `E: ${Math.ceil(platCd / 15)}` : `E: INK LEDGE`;
+
+  if (mode !== 'puzzle') {
+    tagJumps.textContent = `AIR JUMPS: ${airJumpsLeft}/${maxAirJumps}`;
+    tagJumps.style.background = airJumpsLeft > 0 ? '#faf6ee' : '#dfd7c5';
+  }
+}
+
+// shared player movement + 3 abilities (Air Dash, Ground Slam, Ink Ledge) + multi-air-jump
+function stepPlayerInput(p, baseSpeed = 4.7) {
+  const L = keys['arrowleft'] || keys['a'];
+  const R = keys['arrowright'] || keys['d'];
+  const J = keys['arrowup'] || keys['w'] || keys[' '];
+  const D = keys['shift'] || keys['x'] || keys['k'];
+  const S = keys['arrowdown'] || keys['s'];
+  const P = keys['e'] || keys['c'] || keys['l'];
+
+  const jumpJustPressed = J && !prevJumpKey;
+  const dashJustPressed = D && !prevDashKey;
+  const slamJustPressed = S && !prevSlamKey;
+  const platJustPressed = P && !prevPlatKey;
+
+  prevJumpKey = J;
+  prevDashKey = D;
+  prevSlamKey = S;
+  prevPlatKey = P;
+
+  if (dashCd > 0) dashCd--;
+  if (platCd > 0) platCd--;
+
+  const spd = baseSpeed * speedMult;
+
+  // ABILITY 1: Air Dash (Shift / X)
+  if (dashJustPressed && dashCd === 0) {
+    dashTimer = 9;
+    dashCd = 42;
+    slamming = false;
+    p.vx = p.dir * 13.5;
+    p.vy = 0;
+    p.sx = 1.5;
+    p.sy = 0.65;
+    sndAll(480, 'sawtooth', 0.08, -180);
+    burst(p.x + 11, p.y + 11, COL.ink, 10);
+  }
+
+  // ABILITY 2: Ground Slam (S / Down in mid-air) - smashes through hazards!
+  if (slamJustPressed && coyote === 0 && !slamming) {
+    slamming = true;
+    dashTimer = 0;
+    p.vx *= 0.25;
+    p.vy = 16 * gravSign;
+    p.sx = 0.62;
+    p.sy = 1.55;
+    sndAll(180, 'square', 0.12, -80);
+  }
+
+  // ABILITY 3: Spawn Ink Ledge underneath player (E / C)
+  if (platJustPressed && platCd === 0) {
+    platCd = 110;
+    const ly = gravSign > 0 ? p.y + p.h + 4 : p.y - 18;
+    inkPlats.push({ x: p.x - 24, y: ly, w: 70, h: 14, life: 165 });
+    p.vy = -3 * gravSign;
+    sndAll(390, 'triangle', 0.1, 140);
+    burst(p.x + 11, ly + 7, COL.teal, 10);
+  }
+
+  if (dashTimer > 0) {
+    dashTimer--;
+    p.vy = 0;
+    p.vx = p.dir * 12.5;
+    if (dashTimer % 2 === 0) {
+      particles.push({ x: p.x + 8, y: p.y + 8, vx: 0, vy: 0, life: 0.55, c: COL.muted });
+    }
+  } else {
+    if (L) { p.vx = -spd; p.dir = -1; }
+    else if (R) { p.vx = spd; p.dir = 1; }
+    else p.vx *= 0.76;
+
+    if (coyote > 0) coyote--;
+
+    // Ground Jump or Multi-Air-Jump
+    if (jumpJustPressed) {
+      if (coyote > 0) {
+        p.vy = -10.6 * gravSign;
+        coyote = 0;
+        slamming = false;
+        p.sx = 0.74;
+        p.sy = 1.32;
+        sndAll(310, 'triangle', 0.09, 160);
+      } else if (airJumpsLeft > 0) {
+        airJumpsLeft--;
+        p.vy = -10.2 * gravSign;
+        slamming = false;
+        p.sx = 0.72;
+        p.sy = 1.35;
+        sndAll(420, 'sine', 0.1, 220);
+        burst(p.x + 11, p.y + p.h, COL.teal, 8);
+      }
+    }
+
+    p.vy += 0.47 * gravSign;
+    if (gravSign > 0) p.vy = Math.min(slamming ? 17 : 12.5, p.vy);
+    else p.vy = Math.max(slamming ? -17 : -12.5, p.vy);
+  }
+
+  p.x += p.vx;
+  p.y += p.vy;
+  p.sx += (1 - p.sx) * 0.22;
+  p.sy += (1 - p.sy) * 0.22;
+
+  // tick temporary ink ledges
+  for (let i = inkPlats.length - 1; i >= 0; i--) {
+    inkPlats[i].life--;
+    if (inkPlats[i].life <= 0) inkPlats.splice(i, 1);
+  }
+
+  updateAbilityHUD();
+}
+
+function landOnSurface(p, surfaceY) {
+  if (gravSign > 0) p.y = surfaceY - p.h;
+  else p.y = surfaceY;
+
+  if (slamming) {
+    slamming = false;
+    shake = 9;
+    p.vy = -13.2 * gravSign; // slam shockwave super-bounce
+    p.sx = 1.45;
+    p.sy = 0.6;
+    sndAll(130, 'sawtooth', 0.18, 220);
+    burst(p.x + 11, p.y + p.h, COL.gold, 16);
+    return false;
+  }
+
+  if (Math.abs(p.vy) > 3) { p.sx = 1.25; p.sy = 0.78; }
+  p.vy = 0;
+  coyote = 7;
+  airJumpsLeft = maxAirJumps;
+  return true;
+}
+
+function tickEndless() {
+  const isChaos = mode === 'chaos';
+  const p = state.p;
+
+  // milestone check: +1 air jump every 100m!
+  const targetJumps = 1 + Math.floor(endless.dist / 100) + (chaosEvent === "MOON JUMP" ? 2 : 0);
+  if (1 + Math.floor(endless.dist / 100) > 1 + Math.floor(endless.lastMilestone / 100)) {
+    endless.lastMilestone = endless.dist;
+    showBanner(`+1 EXTRA AIR JUMP! (${1 + Math.floor(endless.dist / 100)}x JUMPS)`);
+    snd(520, 'triangle', 0.25, 340);
+    burst(p.x, p.y, COL.teal, 22);
+  }
+  maxAirJumps = targetJumps;
+
+  // chaos mode random event wheel every 6 seconds
+  if (isChaos) {
+    chaosClock--;
+    if (chaosClock <= 0) {
+      chaosClock = 340;
+      const events = ["TURBO SPEED", "METEOR SHOWER", "LOW GRAV +2 JUMPS", "SPRING FEVER", "INK REFILL"];
+      chaosEvent = events[Math.floor(Math.random() * events.length)];
+      showBanner(`CHAOS: ${chaosEvent}!`);
+      snd(440, 'square', 0.2, 260);
+
+      speedMult = chaosEvent === "TURBO SPEED" ? 1.38 : 1.0;
+      if (chaosEvent === "INK REFILL") {
+        dashCd = 0;
+        platCd = 0;
+        airJumpsLeft = maxAirJumps + 2;
+      }
+      if (chaosEvent === "SPRING FEVER") {
+        endless.plats.forEach(pl => { if (pl.kind === 'solid') pl.kind = 'spring'; });
+      }
+    }
+
+    // spawn meteors in chaos mode
+    if (Math.random() < (chaosEvent === "METEOR SHOWER" ? 0.08 : 0.022)) {
+      meteors.push({
+        x: endless.camX + Math.random() * (window.innerWidth + 300),
+        y: 35,
+        vx: -1.8 - Math.random() * 2,
+        vy: 3.8 + Math.random() * 2.5,
+        r: 10
+      });
+    }
+  }
+
+  stepPlayerInput(p, 5.1);
+
+  // camera scroll
+  const targetCam = p.x - window.innerWidth * 0.32;
+  if (targetCam > endless.camX) {
+    endless.camX += (targetCam - endless.camX) * 0.15;
+  }
+  if (endless.dist > 10) {
+    const baseScroll = isChaos ? 1.65 : 1.15;
+    endless.camX += baseScroll + Math.min(2.6, endless.dist / 1100);
+  }
+
+  endless.dist = Math.max(endless.dist, Math.floor((p.x - 90) / 18));
+  if (!isChaos && endless.dist > bestDist) {
+    bestDist = endless.dist;
+    localStorage.setItem('pw_best_dist', String(bestDist));
+  } else if (isChaos && endless.dist > bestChaos) {
+    bestChaos = endless.dist;
+    localStorage.setItem('pw_best_chaos', String(bestChaos));
+  }
+
+  while (endless.nextX < endless.camX + window.innerWidth + 500) {
+    spawnEndlessChunk();
+  }
+  endless.plats = endless.plats.filter(pl => pl.x + pl.w > endless.camX - 200 && pl.y < window.innerHeight + 200);
+
+  // check temporary ink ledges
+  for (const ip of inkPlats) {
+    if (p.x < ip.x + ip.w && p.x + p.w > ip.x && p.y < ip.y + ip.h && p.y + p.h > ip.y) {
+      if (p.vy >= 0 && (p.y + p.h - p.vy) <= ip.y + 15) {
+        landOnSurface(p, ip.y);
+      }
+    }
+  }
+
+  for (let i = endless.plats.length - 1; i >= 0; i--) {
+    const pl = endless.plats[i];
+    if (pl.vx) {
+      pl.x += pl.vx;
+      if (pl.x < pl.minX || pl.x > pl.maxX) pl.vx *= -1;
+    }
+    if (pl.kind === 'crumble' && pl.touched) {
+      if (pl.fallTimer > 0) pl.fallTimer--;
+      else { pl.vy += 0.38; pl.y += pl.vy; }
+    }
+
+    if (p.x < pl.x + pl.w && p.x + p.w > pl.x && p.y < pl.y + pl.h && p.y + p.h > pl.y) {
+      if (pl.kind === 'hazard') {
+        if (slamming || dashTimer > 0) {
+          // smash hazard block with Slam or Dash!
+          burst(pl.x + pl.w / 2, pl.y, COL.red, 14);
+          endless.plats.splice(i, 1);
+          shake = 6;
+          snd(200, 'square', 0.1, 100);
+          continue;
+        }
+        burst(p.x, p.y, COL.red, 14);
+        askReset();
+        return;
+      }
+      if (p.vy >= 0 && (p.y + p.h - p.vy) <= pl.y + 16) {
+        if (pl.vx) p.x += pl.vx;
+        if (pl.kind === 'spring') {
+          p.y = pl.y - p.h;
+          p.vy = -14.8;
+          slamming = false;
+          airJumpsLeft = maxAirJumps;
+          p.sx = 0.65;
+          p.sy = 1.45;
+          snd(240, 'triangle', 0.14, 320);
+          burst(p.x + 11, p.y + 22, COL.gold, 10);
+        } else {
+          if (pl.kind === 'crumble') pl.touched = true;
+          landOnSurface(p, pl.y);
+        }
+      }
+    }
+  }
+
+  // update chaos meteors
+  for (let i = meteors.length - 1; i >= 0; i--) {
+    const m = meteors[i];
+    m.x += m.vx;
+    m.y += m.vy;
+    if (m.y > window.innerHeight + 40) {
+      meteors.splice(i, 1);
+      continue;
+    }
+    if (Math.hypot((p.x + 11) - m.x, (p.y + 11) - m.y) < m.r + 10) {
+      if (dashTimer > 0 || slamming) {
+        burst(m.x, m.y, COL.gold, 12);
+        meteors.splice(i, 1);
+        continue;
+      }
+      burst(p.x, p.y, COL.red, 16);
+      askReset();
+      return;
+    }
+  }
+
+  if (p.y > window.innerHeight + 90 || p.x + p.w < endless.camX) {
+    burst(p.x, p.y, COL.red, 14);
+    askReset();
+  }
+}
+
+function tickPuzzle() {
+  winRects[0] = getMyRect();
+  const now = Date.now();
+  for (const id in winRects) {
+    if (id !== '0' && now - winRects[id].t > 1200) delete winRects[id];
+  }
+
+  const l = curStage;
+  const p = state.p;
+
+  state.platOffsets = l.plats.map(pl => {
+    if (pl.vx) {
+      pl.x += pl.vx;
+      if (pl.x < pl.minX || pl.x > pl.maxX) pl.vx *= -1;
+    }
+    return pl.x;
+  });
+
+  stepPlayerInput(p, 4.6);
+
+  // check temporary ink ledges in global space
+  for (const ip of inkPlats) {
+    if (p.x < ip.x + ip.w && p.x + p.w > ip.x && p.y < ip.y + ip.h && p.y + p.h > ip.y) {
+      if (p.vy >= 0 && (p.y + p.h - p.vy) <= ip.y + 15) {
+        landOnSurface(p, ip.y);
+      }
+    }
+  }
+
+  for (const pl of l.plats) {
+    const wr = winRects[pl.w];
+    if (!wr) continue;
+    const rx = wr.x + pl.x;
+    const ry = wr.y + pl.y;
+
+    if (p.x < rx + pl.width && p.x + p.w > rx && p.y < ry + pl.height && p.y + p.h > ry) {
+      if (pl.kind === 'hazard') {
+        askReset();
+        return;
+      }
+      if (p.vy >= 0 && (p.y + p.h - p.vy) <= ry + 15) {
+        if (pl.vx) p.x += pl.vx;
+        if (pl.kind === 'spring') {
+          p.y = ry - p.h;
+          p.vy = -14.6;
+          slamming = false;
+          airJumpsLeft = maxAirJumps;
+          p.sx = 0.65;
+          p.sy = 1.45;
+          sndAll(240, 'triangle', 0.15, 320);
+        } else {
+          landOnSurface(p, ry);
+        }
+      }
+    }
+  }
+
+  let inside = false;
+  for (const id in winRects) {
+    const wr = winRects[id];
+    if (
+      p.x + p.w > wr.x - 150 &&
+      p.x < wr.x + wr.w + 150 &&
+      p.y + p.h > wr.y - 210 &&
+      p.y < wr.y + wr.h + 100
+    ) {
+      inside = true;
+    }
+  }
+  if (!inside) {
+    askReset();
+    return;
+  }
+
+  for (const k of l.keys) {
+    if (state.gotKey) continue;
+    const wr = winRects[k.w];
+    if (!wr) continue;
+    if (Math.hypot((p.x + 11) - (wr.x + k.x), (p.y + 11) - (wr.y + k.y)) < 26) {
+      state.gotKey = true;
+      state.open = true;
+      sndAll(520, 'sine', 0.16, 280);
+    }
+  }
+
+  state.rays = [];
+  let hitTarget = false;
+  for (const b of l.beams) {
+    const wr = winRects[b.w];
+    if (!wr) continue;
+    let rx = wr.x + b.x;
+    let ry = wr.y + b.y;
+    let dx = b.dx;
+    let dy = b.dy;
+    let sPt = { x: rx, y: ry };
+
+    for (let i = 0; i < 420; i++) {
+      rx += dx * 5;
+      ry += dy * 5;
+      for (const m of l.mirrors) {
+        const mw = winRects[m.w];
+        if (!mw) continue;
+        const mx = mw.x + m.x;
+        const my = mw.y + m.y;
+        if (rx > mx && rx < mx + m.size && ry > my && ry < my + m.size && dx !== 0) {
+          state.rays.push({ x1: sPt.x, y1: sPt.y, x2: rx, y2: ry });
+          sPt = { x: rx, y: ry };
+          dx = 0;
+          dy = -1;
+        }
+      }
+      for (const t of l.targets) {
+        const tw = winRects[t.w];
+        if (!tw) continue;
+        const tx = tw.x + t.x;
+        const ty = tw.y + t.y;
+        if (rx > tx && rx < tx + t.width && ry > ty && ry < ty + t.height) {
+          hitTarget = true;
+        }
+      }
+    }
+    state.rays.push({ x1: sPt.x, y1: sPt.y, x2: rx, y2: ry });
+  }
+
+  if (l.targets.length > 0) {
+    if (hitTarget && !state.open) sndAll(580, 'sine', 0.14, 180);
+    state.open = hitTarget;
+  }
+
+  const ew = winRects[l.exit.w];
+  if (ew && state.open) {
+    const ex = ew.x + l.exit.x;
+    const ey = ew.y + l.exit.y;
+    if (Math.hypot((p.x + 11) - ex, (p.y + 11) - ey) < 28) {
+      sndAll(400, 'triangle', 0.22, 300);
+      loadStage(curIdx + 1);
+    }
+  }
+
+  state.inkPlats = inkPlats;
+  state.rects = winRects;
+  bus.postMessage({ cmd: 'state', state });
+}
+
+setInterval(() => {
+  if (isHost) {
+    if (mode === 'endless' || mode === 'chaos') tickEndless();
+    else tickPuzzle();
+  } else {
+    bus.postMessage({ cmd: 'rect', rect: getMyRect() });
+  }
+}, 1000 / 60);
+
+function drawBlock(x, y, w, h, fill, kind) {
+  ctx.fillStyle = COL.ink;
+  ctx.fillRect(x + 3, y + 3, w, h);
+
+  ctx.fillStyle = fill;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = COL.ink;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
+
+  if (kind === 'hazard') {
+    ctx.beginPath();
+    for (let sx = x + 8; sx < x + w; sx += 10) {
+      ctx.moveTo(sx, y);
+      ctx.lineTo(Math.max(x, sx - 8), y + h);
+    }
+    ctx.stroke();
+  } else if (kind === 'spring') {
+    ctx.beginPath();
+    ctx.moveTo(x + 4, y + h / 2);
+    ctx.lineTo(x + w - 4, y + h / 2);
+    ctx.stroke();
+  }
+}
+
+function drawPlayer(px, py, p) {
+  ctx.save();
+  ctx.translate(px + p.w / 2, py + p.h);
+  ctx.scale(p.sx || 1, p.sy || 1);
+
+  ctx.fillStyle = COL.ink;
+  ctx.fillRect(-p.w / 2 + 3, -p.h + 3, p.w, p.h);
+
+  ctx.fillStyle = slamming ? COL.gold : (dashTimer > 0 ? COL.teal : COL.paper);
+  ctx.fillRect(-p.w / 2, -p.h, p.w, p.h);
+  ctx.strokeStyle = COL.ink;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-p.w / 2, -p.h, p.w, p.h);
+
+  ctx.fillStyle = COL.ink;
+  const look = (p.dir || 1) * 3;
+  ctx.fillRect(-5 + look, -15, 3, 5);
+  ctx.fillRect(2 + look, -15, 3, 5);
+  ctx.restore();
+}
+
+function render() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  ctx.save();
+  if (shake > 0.2) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= 0.84;
+  }
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (isHost && (mode === 'endless' || mode === 'chaos')) {
+    const isChaos = mode === 'chaos';
+    const record = isChaos ? bestChaos : bestDist;
+    labelEl.textContent = `${isChaos ? 'CHAOS' : 'DIST'}: ${endless.dist}m (BEST: ${record}m)`;
+    subEl.textContent = isChaos
+      ? `EVENT: ${chaosEvent} | +1 air jump every 100m`
+      : `+1 air jump every 100m | smash spikes with S-slam or SHIFT-dash`;
+
+    ctx.strokeStyle = COL.grid;
+    ctx.lineWidth = 1;
+    const gx = -(endless.camX % 40);
+    for (let x = gx; x < canvas.width; x += 40) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 36; y < canvas.height; y += 40) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+
+    // draw distance markers every 100m
+    const firstMark = Math.floor(endless.camX / 1800) * 1800;
+    for (let mx = firstMark; mx < endless.camX + canvas.width; mx += 1800) {
+      if (mx <= 0) continue;
+      const sx = mx - endless.camX + 90;
+      ctx.strokeStyle = COL.muted;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(sx, 36); ctx.lineTo(sx, canvas.height); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = COL.ink;
+      ctx.font = 'bold 11px Courier New';
+      ctx.fillText(`${mx / 18}m (+1 JUMP)`, sx + 6, 56);
+    }
+
+    for (const pl of endless.plats) {
+      const px = pl.x - endless.camX;
+      let fill = COL.paper;
+      if (pl.kind === 'hazard') fill = COL.red;
+      else if (pl.kind === 'spring') fill = COL.gold;
+      else if (pl.kind === 'crumble') fill = '#d8ccb8';
+      drawBlock(px, pl.y, pl.w, pl.h, fill, pl.kind);
+    }
+
+    for (const ip of inkPlats) {
+      drawBlock(ip.x - endless.camX, ip.y, ip.w, ip.h, COL.teal, 'solid');
+    }
+
+    for (const m of meteors) {
+      const mx = m.x - endless.camX;
+      ctx.fillStyle = COL.red;
+      ctx.strokeStyle = COL.ink;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(mx, m.y, m.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = COL.red;
+    ctx.fillRect(0, 36, 6, canvas.height);
+
+    drawPlayer(state.p.x - endless.camX, state.p.y, state.p);
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const pt = particles[i];
+      pt.x += pt.vx;
+      pt.y += pt.vy;
+      pt.life -= 0.04;
+      if (pt.life <= 0) { particles.splice(i, 1); continue; }
+      ctx.fillStyle = pt.c;
+      ctx.fillRect(pt.x - endless.camX, pt.y, 4, 4);
+    }
+
+    if (bannerTimer > 0) {
+      bannerTimer--;
+      ctx.fillStyle = COL.ink;
+      ctx.fillRect(canvas.width / 2 - 170, 62, 340, 32);
+      ctx.fillStyle = COL.paper;
+      ctx.strokeStyle = COL.ink;
+      ctx.lineWidth = 2;
+      ctx.fillRect(canvas.width / 2 - 173, 59, 340, 32);
+      ctx.strokeRect(canvas.width / 2 - 173, 59, 340, 32);
+      ctx.fillStyle = COL.ink;
+      ctx.font = 'bold 13px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText(bannerText, canvas.width / 2 - 3, 80);
+      ctx.textAlign = 'left';
+    }
+
+    ctx.restore();
+    requestAnimationFrame(render);
+    return;
+  }
+
+  // multi-window puzzle render
+  const raw = getMyRect();
+  if (!smoothRect) smoothRect = { ...raw };
+  else {
+    smoothRect.x += (raw.x - smoothRect.x) * 0.45;
+    smoothRect.y += (raw.y - smoothRect.y) * 0.45;
+    smoothRect.w = raw.w;
+    smoothRect.h = raw.h;
+  }
+
+  labelEl.textContent = `WIN #${winId} | STAGE ${curIdx + 1}/100`;
+  subEl.textContent = curStage.note;
+
+  ctx.strokeStyle = COL.grid;
+  ctx.lineWidth = 1;
+  const gx = -(smoothRect.x % 40);
+  const gy = -(smoothRect.y % 40);
+  for (let x = gx; x < canvas.width; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+  }
+  for (let y = gy; y < canvas.height; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  }
+
+  for (const id in state.rects) {
+    if (parseInt(id, 10) === winId) continue;
+    const wr = state.rects[id];
+    const ox = wr.x - smoothRect.x;
+    const oy = wr.y - smoothRect.y;
+
+    ctx.strokeStyle = COL.muted;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(ox, oy, wr.w, wr.h);
+    ctx.setLineDash([]);
+
+    const tx = Math.max(16, Math.min(canvas.width - 75, ox + wr.w / 2 - 28));
+    const ty = Math.max(52, Math.min(canvas.height - 14, oy + wr.h / 2));
+    ctx.fillStyle = COL.ink;
+    ctx.font = 'bold 11px Courier New';
+    ctx.fillText(`[WIN #${id}]`, tx, ty);
+  }
+
+  curStage.plats.forEach((pl, i) => {
+    const wr = state.rects[pl.w];
+    if (!wr) return;
+    const curX = state.platOffsets[i] !== undefined ? state.platOffsets[i] : pl.x;
+    const px = wr.x + curX - smoothRect.x;
+    const py = wr.y + pl.y - smoothRect.y;
+
+    let fill = COL.paper;
+    if (pl.kind === 'hazard') fill = COL.red;
+    else if (pl.kind === 'spring') fill = COL.gold;
+    drawBlock(px, py, pl.width, pl.height, fill, pl.kind);
+  });
+
+  for (const ip of (state.inkPlats || [])) {
+    drawBlock(ip.x - smoothRect.x, ip.y - smoothRect.y, ip.w, ip.h, COL.teal, 'solid');
+  }
+
+  for (const m of curStage.mirrors) {
+    const wr = state.rects[m.w];
+    if (!wr) continue;
+    const mx = wr.x + m.x - smoothRect.x;
+    const my = wr.y + m.y - smoothRect.y;
+    ctx.strokeStyle = COL.ink;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(mx, my + m.size);
+    ctx.lineTo(mx + m.size, my);
+    ctx.stroke();
+  }
+
+  for (const t of curStage.targets) {
+    const wr = state.rects[t.w];
+    if (!wr) continue;
+    const tx = wr.x + t.x - smoothRect.x;
+    const ty = wr.y + t.y - smoothRect.y;
+    drawBlock(tx, ty, t.width, t.height, state.open ? COL.teal : COL.gold, 'solid');
+  }
+
+  ctx.strokeStyle = COL.red;
+  ctx.lineWidth = 3;
+  for (const r of state.rays) {
+    ctx.beginPath();
+    ctx.moveTo(r.x1 - smoothRect.x, r.y1 - smoothRect.y);
+    ctx.lineTo(r.x2 - smoothRect.x, r.y2 - smoothRect.y);
+    ctx.stroke();
+  }
+
+  for (const k of curStage.keys) {
+    if (state.gotKey) continue;
+    const wr = state.rects[k.w];
+    if (!wr) continue;
+    const kx = wr.x + k.x - smoothRect.x;
+    const ky = wr.y + k.y - smoothRect.y;
+    ctx.fillStyle = COL.gold;
+    ctx.strokeStyle = COL.ink;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(kx, ky, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  const ew = state.rects[curStage.exit.w];
+  if (ew) {
+    const ex = ew.x + curStage.exit.x - smoothRect.x;
+    const ey = ew.y + curStage.exit.y - smoothRect.y;
+    drawBlock(ex - 14, ey - 18, 28, 36, state.open ? COL.teal : '#ccc4b4', 'solid');
+    ctx.fillStyle = COL.ink;
+    ctx.fillRect(ex + 5, ey - 2, 4, 4);
+  }
+
+  drawPlayer(state.p.x - smoothRect.x, state.p.y - smoothRect.y, state.p);
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const pt = particles[i];
+    pt.x += pt.vx;
+    pt.y += pt.vy;
+    pt.life -= 0.04;
+    if (pt.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.fillStyle = pt.c;
+    ctx.fillRect(pt.x - smoothRect.x, pt.y - smoothRect.y, 4, 4);
+  }
+
+  ctx.restore();
+  requestAnimationFrame(render);
+}
+
+if (isHost) loadStage(0);
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
