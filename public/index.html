@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <title>paperweight</title>
+<script>if (/^#(?:confirmation_token|recovery_token|invite_token|access_token|email_change_token)=/.test(location.hash)) location.replace('/leaderboard.html'+location.hash);</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
   body {
@@ -58,6 +60,10 @@
     border: 1.5px solid #181715;
     background: #faf6ee;
   }
+  #community-nav {position:fixed;bottom:14px;right:14px;z-index:12;max-width:calc(100vw - 28px);background:#f2ece1;border:1.5px solid #181715;padding:10px 14px;box-shadow:3px 3px 0 #181715;font:12px/1.5 'Courier New',monospace;}
+  #community-nav a {color:#181715;text-underline-offset:3px;margin-right:14px;}
+  #community-status {display:block;font-size:10px;color:#5a554c;max-width:310px;}
+  #bar {overflow-x:auto;gap:20px;} #bar > .row {flex-shrink:0;}
 </style>
 </head>
 <body>
@@ -87,10 +93,13 @@
 </div>
 <canvas id="c"></canvas>
 
+<aside id="community-nav" aria-label="Community"><a href="/leaderboard.html">Worldwide ranks ↗</a><a href="/support.html">Support the game ↗</a><span id="community-status" role="status">Sign in on Worldwide ranks to post scores.</span></aside>
+<script src="/game-community.js"></script>
 <script>
 const params = new URLSearchParams(location.search);
 const winId = parseInt(params.get('w') || '0', 10);
 const isHost = winId === 0;
+if (!isHost) document.getElementById("community-nav").hidden = true;
 const bus = new BroadcastChannel('pw_sync_v4');
 
 const canvas = document.getElementById('c');
@@ -394,6 +403,7 @@ function showBanner(txt) {
 
 function setMode(m) {
   if (!isHost) return;
+  if (m === 'puzzle' && (mode === 'endless' || mode === 'chaos')) communityFinish(endless.dist);
   mode = m;
   state.mode = m;
   document.getElementById('modePuzzle').className = m === 'puzzle' ? 'active' : '';
@@ -474,6 +484,7 @@ function loadStage(idx) {
 }
 
 function initEndless() {
+  if (isHost) communityStart(mode, endless.dist);
   resetAbilities();
   endless.camX = 0;
   endless.nextX = 0;
@@ -1354,6 +1365,18 @@ function render() {
 
 if (isHost) loadStage(0);
 requestAnimationFrame(render);
+</script>
+<script type="module">
+import { getUser } from 'https://esm.sh/@netlify/identity@2.0.1?bundle';
+getUser().catch(() => {});
+</script>
+<script>
+document.querySelectorAll('#community-nav a').forEach(link => link.addEventListener('click', async event => {
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  if (isHost && (mode === 'endless' || mode === 'chaos')) await communityFinish(endless.dist);
+  location.href = link.href;
+}));
 </script>
 </body>
 </html>
